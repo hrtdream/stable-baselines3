@@ -146,9 +146,11 @@ class BaseAlgorithm(ABC):
         # Buffers for logging
         self.ep_info_buffer = None  # type: Optional[deque]
         self.ep_success_buffer = None  # type: Optional[deque]
-        self.ep_crash_buffer = None
-        self.ep_success_buffer_20 = None  # type: Optional[deque]
-        self.ep_crash_buffer_20 = None
+        self.ep_collision_buffer = None
+        self.ep_out_of_bound_buffer = None
+        self.ep_timeout_buffer = None
+        self.ep_success_len_buffer = None
+        self.ep_success_dist_buffer = None
         # For logging (and TD3 delayed updates)
         self._n_updates = 0  # type: int
         # The logger object
@@ -414,9 +416,11 @@ class BaseAlgorithm(ABC):
             # Initialize buffers if they don't exist, or reinitialize if resetting counters
             self.ep_info_buffer = deque(maxlen=100)
             self.ep_success_buffer = deque(maxlen=100)
-            self.ep_crash_buffer = deque(maxlen=100)
-            self.ep_success_buffer_20 = deque(maxlen=20)
-            self.ep_crash_buffer_20 = deque(maxlen=20)
+            self.ep_collision_buffer = deque(maxlen=100)
+            self.ep_out_of_bound_buffer = deque(maxlen=100)
+            self.ep_timeout_buffer = deque(maxlen=100)
+            self.ep_success_len_buffer = deque(maxlen=100)
+            self.ep_success_dist_buffer = deque(maxlen=100)
 
         if self.action_noise is not None:
             self.action_noise.reset()
@@ -466,14 +470,20 @@ class BaseAlgorithm(ABC):
             maybe_ep_info = info.get("episode")
             maybe_is_success = info.get("is_success")
             maybe_is_crash = info.get("is_crash")
+            maybe_is_out_of_bound = info.get("is_not_in_workspace")
+            maybe_is_timeout = info.get("is_timeout")
+            maybe_episode_length = info.get("episode_steps")
+            maybe_episode_distance = info.get("episode_distance")
             if maybe_ep_info is not None:
                 self.ep_info_buffer.extend([maybe_ep_info])
             if maybe_is_success is not None and dones[idx]:
                 self.ep_success_buffer.append(maybe_is_success)
-                self.ep_crash_buffer.append(maybe_is_crash)
-                self.ep_success_buffer_20.append(maybe_is_success)
-                self.ep_crash_buffer_20.append(maybe_is_crash)
-
+                self.ep_collision_buffer.append(maybe_is_crash)
+                self.ep_out_of_bound_buffer.append(maybe_is_out_of_bound)
+                self.ep_timeout_buffer.append(maybe_is_timeout)
+                if maybe_is_success:
+                    self.ep_success_len_buffer.append(maybe_episode_length)
+                    self.ep_success_dist_buffer.append(maybe_episode_distance)
 
     def get_env(self) -> Optional[VecEnv]:
         """

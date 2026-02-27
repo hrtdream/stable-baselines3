@@ -450,9 +450,12 @@ class OffPolicyAlgorithm(BaseAlgorithm):
 
         if len(self.ep_success_buffer) > 0:
             self.logger.record("rollout/success_rate", safe_mean(self.ep_success_buffer))
-            self.logger.record("rollout/crash_rate", safe_mean(self.ep_crash_buffer))
-            self.logger.record("rollout/success_rate_20", safe_mean(self.ep_success_buffer_20))
-            self.logger.record("rollout/crash_rate_20", safe_mean(self.ep_crash_buffer_20))
+            self.logger.record("rollout/collision_rate", safe_mean(self.ep_collision_buffer))
+            self.logger.record("rollout/out_of_bound_rate", safe_mean(self.ep_out_of_bound_buffer))
+            self.logger.record("rollout/timeout_rate", safe_mean(self.ep_timeout_buffer))
+            if len(self.ep_success_len_buffer) > 0:
+                self.logger.record("rollout/success_len_mean", safe_mean(self.ep_success_len_buffer))
+                self.logger.record("rollout/success_dist_mean", safe_mean(self.ep_success_dist_buffer))
         # Pass the number of timesteps for tensorboard
         self.logger.dump(step=self.num_timesteps)
 
