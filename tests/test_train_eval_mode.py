@@ -1,6 +1,4 @@
-from typing import Union
-
-import gym
+import gymnasium as gym
 import numpy as np
 import pytest
 import torch as th
@@ -28,7 +26,7 @@ class FlattenBatchNormDropoutExtractor(BaseFeaturesExtractor):
     """
 
     def __init__(self, observation_space: gym.Space):
-        super(FlattenBatchNormDropoutExtractor, self).__init__(
+        super().__init__(
             observation_space,
             get_flattened_obs_dim(observation_space),
         )
@@ -123,7 +121,7 @@ def clone_sac_batch_norm_stats(
     return (actor_bias, actor_running_mean, critic_bias, critic_running_mean, critic_target_bias, critic_target_running_mean)
 
 
-def clone_on_policy_batch_norm(model: Union[A2C, PPO]) -> (th.Tensor, th.Tensor):
+def clone_on_policy_batch_norm(model: A2C | PPO) -> (th.Tensor, th.Tensor):
     return clone_batch_norm_stats(model.policy.features_extractor.batch_norm)
 
 
@@ -143,7 +141,8 @@ def test_dqn_train_with_batch_norm():
         policy_kwargs=dict(net_arch=[16, 16], features_extractor_class=FlattenBatchNormDropoutExtractor),
         learning_starts=0,
         seed=1,
-        tau=0,  # do not clone the target
+        tau=0.0,  # do not clone the target
+        target_update_interval=100,  # Copy the stats to the target
     )
 
     (
@@ -154,6 +153,9 @@ def test_dqn_train_with_batch_norm():
     ) = clone_dqn_batch_norm_stats(model)
 
     model.learn(total_timesteps=200)
+    # Force stats copy
+    model.target_update_interval = 1
+    model._on_step()
 
     (
         q_net_bias_after,
@@ -165,14 +167,18 @@ def test_dqn_train_with_batch_norm():
     assert ~th.isclose(q_net_bias_before, q_net_bias_after).all()
     assert ~th.isclose(q_net_running_mean_before, q_net_running_mean_after).all()
 
+    # No weight update
+    assert th.isclose(q_net_bias_before, q_net_target_bias_after).all()
     assert th.isclose(q_net_target_bias_before, q_net_target_bias_after).all()
-    assert th.isclose(q_net_target_running_mean_before, q_net_target_running_mean_after).all()
+    # Running stat should be copied even when tau=0
+    assert th.isclose(q_net_running_mean_before, q_net_target_running_mean_before).all()
+    assert th.isclose(q_net_running_mean_after, q_net_target_running_mean_after).all()
 
 
 def test_td3_train_with_batch_norm():
     model = TD3(
         "MlpPolicy",
-        "Pendulum-v0",
+        "Pendulum-v1",
         policy_kwargs=dict(net_arch=[16, 16], features_extractor_class=FlattenBatchNormDropoutExtractor),
         learning_starts=0,
         tau=0,  # do not copy the target
@@ -185,9 +191,9 @@ def test_td3_train_with_batch_norm():
         critic_bias_before,
         critic_running_mean_before,
         actor_target_bias_before,
-        actor_target_running_mean_before,
+        _actor_target_running_mean_before,
         critic_target_bias_before,
-        critic_target_running_mean_before,
+        _critic_target_running_mean_before,
     ) = clone_td3_batch_norm_stats(model)
 
     model.learn(total_timesteps=200)
@@ -210,16 +216,18 @@ def test_td3_train_with_batch_norm():
     assert ~th.isclose(critic_running_mean_before, critic_running_mean_after).all()
 
     assert th.isclose(actor_target_bias_before, actor_target_bias_after).all()
-    assert th.isclose(actor_target_running_mean_before, actor_target_running_mean_after).all()
+    # Running stat should be copied even when tau=0
+    assert th.isclose(actor_running_mean_after, actor_target_running_mean_after).all()
 
     assert th.isclose(critic_target_bias_before, critic_target_bias_after).all()
-    assert th.isclose(critic_target_running_mean_before, critic_target_running_mean_after).all()
+    # Running stat should be copied even when tau=0
+    assert th.isclose(critic_running_mean_after, critic_target_running_mean_after).all()
 
 
 def test_sac_train_with_batch_norm():
     model = SAC(
         "MlpPolicy",
-        "Pendulum-v0",
+        "Pendulum-v1",
         policy_kwargs=dict(net_arch=[16, 16], features_extractor_class=FlattenBatchNormDropoutExtractor),
         learning_starts=0,
         tau=0,  # do not copy the target
@@ -250,14 +258,16 @@ def test_sac_train_with_batch_norm():
     assert ~th.isclose(actor_running_mean_before, actor_running_mean_after).all()
 
     assert ~th.isclose(critic_bias_before, critic_bias_after).all()
-    assert ~th.isclose(critic_running_mean_before, critic_running_mean_after).all()
+    # Running stat should be copied even when tau=0
+    assert th.isclose(critic_running_mean_before, critic_target_running_mean_before).all()
 
     assert th.isclose(critic_target_bias_before, critic_target_bias_after).all()
-    assert th.isclose(critic_target_running_mean_before, critic_target_running_mean_after).all()
+    # Running stat should be copied even when tau=0
+    assert th.isclose(critic_running_mean_after, critic_target_running_mean_after).all()
 
 
 @pytest.mark.parametrize("model_class", [A2C, PPO])
-@pytest.mark.parametrize("env_id", ["Pendulum-v0", "CartPole-v1"])
+@pytest.mark.parametrize("env_id", ["Pendulum-v1", "CartPole-v1"])
 def test_a2c_ppo_train_with_batch_norm(model_class, env_id):
     model = model_class(
         "MlpPolicy",
@@ -281,7 +291,7 @@ def test_offpolicy_collect_rollout_batch_norm(model_class):
     if model_class in [DQN]:
         env_id = "CartPole-v1"
     else:
-        env_id = "Pendulum-v0"
+        env_id = "Pendulum-v1"
 
     clone_helper = CLONE_HELPERS[model_class]
 
@@ -303,12 +313,12 @@ def test_offpolicy_collect_rollout_batch_norm(model_class):
     batch_norm_stats_after = clone_helper(model)
 
     # No change in batch norm params
-    for param_before, param_after in zip(batch_norm_stats_before, batch_norm_stats_after):
+    for param_before, param_after in zip(batch_norm_stats_before, batch_norm_stats_after, strict=True):
         assert th.isclose(param_before, param_after).all()
 
 
 @pytest.mark.parametrize("model_class", [A2C, PPO])
-@pytest.mark.parametrize("env_id", ["Pendulum-v0", "CartPole-v1"])
+@pytest.mark.parametrize("env_id", ["Pendulum-v1", "CartPole-v1"])
 def test_a2c_ppo_collect_rollouts_with_batch_norm(model_class, env_id):
     model = model_class(
         "MlpPolicy",
@@ -320,7 +330,7 @@ def test_a2c_ppo_collect_rollouts_with_batch_norm(model_class, env_id):
 
     bias_before, running_mean_before = clone_on_policy_batch_norm(model)
 
-    total_timesteps, callback = model._setup_learn(total_timesteps=2 * 64, eval_env=model.get_env())
+    _total_timesteps, callback = model._setup_learn(total_timesteps=2 * 64)
 
     for _ in range(2):
         model.collect_rollouts(model.get_env(), callback, model.rollout_buffer, n_rollout_steps=model.n_steps)
@@ -332,7 +342,7 @@ def test_a2c_ppo_collect_rollouts_with_batch_norm(model_class, env_id):
 
 
 @pytest.mark.parametrize("model_class", MODEL_LIST)
-@pytest.mark.parametrize("env_id", ["Pendulum-v0", "CartPole-v1"])
+@pytest.mark.parametrize("env_id", ["Pendulum-v1", "CartPole-v1"])
 def test_predict_with_dropout_batch_norm(model_class, env_id):
     if env_id == "CartPole-v1":
         if model_class in [SAC, TD3]:
@@ -366,5 +376,5 @@ def test_predict_with_dropout_batch_norm(model_class, env_id):
     batch_norm_stats_after = clone_helper(model)
 
     # No change in batch norm params
-    for param_before, param_after in zip(batch_norm_stats_before, batch_norm_stats_after):
+    for param_before, param_after in zip(batch_norm_stats_before, batch_norm_stats_after, strict=True):
         assert th.isclose(param_before, param_after).all()

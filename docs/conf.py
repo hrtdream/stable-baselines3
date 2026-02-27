@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 #
 # Configuration file for the Sphinx documentation builder.
 #
@@ -12,9 +11,9 @@
 # add these directories to sys.path here. If the directory is relative to the
 # documentation root, use os.path.abspath to make it absolute, like shown here.
 #
+import datetime
 import os
 import sys
-from unittest.mock import MagicMock
 
 # We CANNOT enable 'sphinxcontrib.spelling' because ReadTheDocs.org does not support
 # PyEnchant.
@@ -25,34 +24,26 @@ try:
 except ImportError:
     enable_spell_check = False
 
+# Try to enable copy button
+try:
+    import sphinx_copybutton  # noqa: F401
+
+    enable_copy_button = True
+except ImportError:
+    enable_copy_button = False
+
 # source code directory, relative to this file, for sphinx-autobuild
 sys.path.insert(0, os.path.abspath(".."))
 
-
-class Mock(MagicMock):
-    __subclasses__ = []
-
-    @classmethod
-    def __getattr__(cls, name):
-        return MagicMock()
-
-
-# Mock modules that requires C modules
-# Note: because of that we cannot test examples using CI
-# 'torch', 'torch.nn', 'torch.nn.functional',
-# DO not mock modules for now, we will need to do that for read the docs later
-MOCK_MODULES = []
-sys.modules.update((mod_name, Mock()) for mod_name in MOCK_MODULES)
-
 # Read version from file
 version_file = os.path.join(os.path.dirname(__file__), "../stable_baselines3", "version.txt")
-with open(version_file, "r") as file_handler:
+with open(version_file) as file_handler:
     __version__ = file_handler.read().strip()
 
 # -- Project information -----------------------------------------------------
 
 project = "Stable Baselines3"
-copyright = "2020, Stable Baselines3"
+copyright = f"2021-{datetime.date.today().year}, Stable Baselines3"
 author = "Stable Baselines3 Contributors"
 
 # The short X.Y version
@@ -72,17 +63,22 @@ release = __version__
 # ones.
 extensions = [
     "sphinx.ext.autodoc",
-    "sphinx_autodoc_typehints",
     "sphinx.ext.autosummary",
     "sphinx.ext.mathjax",
     "sphinx.ext.ifconfig",
     "sphinx.ext.viewcode",
     # 'sphinx.ext.intersphinx',
     # 'sphinx.ext.doctest'
+    "myst_parser",
 ]
+
+autodoc_typehints = "description"
 
 if enable_spell_check:
     extensions.append("sphinxcontrib.spelling")
+
+if enable_copy_button:
+    extensions.append("sphinx_copybutton")
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ["_templates"]
@@ -90,8 +86,8 @@ templates_path = ["_templates"]
 # The suffix(es) of source filenames.
 # You can specify multiple suffix as a list of string:
 #
-# source_suffix = ['.rst', '.md']
-source_suffix = ".rst"
+source_suffix = [".rst", ".md"]
+# source_suffix = ".rst"
 
 # The master toctree document.
 master_doc = "index"
@@ -101,12 +97,12 @@ master_doc = "index"
 #
 # This is also used if you do content translation via gettext catalogs.
 # Usually you set "language" from the command line for these cases.
-language = None
+language = "en"
 
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
 # This pattern also affects html_static_path and html_extra_path .
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "README.md"]
 
 # The name of the Pygments (syntax highlighting) style to use.
 pygments_style = "sphinx"
@@ -117,13 +113,7 @@ pygments_style = "sphinx"
 # The theme to use for HTML and HTML Help pages.  See the documentation for
 # a list of builtin themes.
 
-# Fix for read the docs
-on_rtd = os.environ.get("READTHEDOCS") == "True"
-if on_rtd:
-    html_theme = "default"
-else:
-    html_theme = "sphinx_rtd_theme"
-
+html_theme = "sphinx_rtd_theme"
 html_logo = "_static/img/logo.png"
 
 
@@ -161,7 +151,7 @@ htmlhelp_basename = "StableBaselines3doc"
 
 # -- Options for LaTeX output ------------------------------------------------
 
-latex_elements = {
+latex_elements: dict[str, str] = {
     # The paper size ('letterpaper' or 'a4paper').
     #
     # 'papersize': 'letterpaper',
@@ -210,6 +200,25 @@ texinfo_documents = [
 
 
 # -- Extension configuration -------------------------------------------------
+
+myst_heading_anchors = 4
+# See: https://myst-parser.readthedocs.io/en/latest/syntax/optional.html
+myst_enable_extensions = [
+    # "amsmath",
+    "attrs_inline",
+    "colon_fence",
+    "deflist",
+    "dollarmath",
+    "fieldlist",
+    # "html_admonition",
+    "html_image",
+    # "linkify",
+    # "replacements",
+    # "smartquotes",
+    # "strikethrough",
+    "substitution",
+    # "tasklist",
+]
 
 # Example configuration for intersphinx: refer to the Python standard library.
 # intersphinx_mapping = {

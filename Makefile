@@ -4,27 +4,35 @@ LINT_PATHS=stable_baselines3/ tests/ docs/conf.py setup.py
 pytest:
 	./scripts/run_tests.sh
 
-type:
-	pytype -j auto
+mypy:
+	mypy ${LINT_PATHS}
+
+missing-annotations:
+	mypy --disallow-untyped-calls --disallow-untyped-defs --ignore-missing-imports stable_baselines3
+
+# missing docstrings
+# pylint -d R,C,W,E -e C0116 stable_baselines3 -j 4
+
+type: mypy
 
 lint:
 	# stop the build if there are Python syntax errors or undefined names
-	# see https://lintlyci.github.io/Flake8Rules/
-	flake8 ${LINT_PATHS} --count --select=E9,F63,F7,F82 --show-source --statistics
+	# see https://www.flake8rules.com/
+	ruff check ${LINT_PATHS} --select=E9,F63,F7,F82 --output-format=full
 	# exit-zero treats all errors as warnings.
-	flake8 ${LINT_PATHS} --count --exit-zero --statistics
+	ruff check ${LINT_PATHS} --exit-zero --output-format=concise
 
 format:
 	# Sort imports
-	isort ${LINT_PATHS}
+	ruff check --select I ${LINT_PATHS} --fix
 	# Reformat using black
-	black -l 127 ${LINT_PATHS}
+	black ${LINT_PATHS}
 
 check-codestyle:
 	# Sort imports
-	isort --check ${LINT_PATHS}
+	ruff check --select I ${LINT_PATHS}
 	# Reformat using black
-	black --check -l 127 ${LINT_PATHS}
+	black --check ${LINT_PATHS}
 
 commit-checks: format type lint
 
@@ -49,14 +57,12 @@ docker-gpu:
 
 # PyPi package release
 release:
-	python setup.py sdist
-	python setup.py bdist_wheel
+	python -m build
 	twine upload dist/*
 
 # Test PyPi package release
 test-release:
-	python setup.py sdist
-	python setup.py bdist_wheel
+	python -m build
 	twine upload --repository-url https://test.pypi.org/legacy/ dist/*
 
 .PHONY: clean spelling doc lint format check-codestyle commit-checks

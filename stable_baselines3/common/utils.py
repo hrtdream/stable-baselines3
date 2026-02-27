@@ -2,13 +2,16 @@ import glob
 import os
 import platform
 import random
+import re
+import warnings
 from collections import deque
-from itertools import zip_longest
-from typing import Dict, Iterable, Optional, Tuple, Union
+from collections.abc import Iterable
 
-import gym
+import cloudpickle
+import gymnasium as gym
 import numpy as np
 import torch as th
+from gymnasium import spaces
 
 import stable_baselines3 as sb3
 
@@ -16,7 +19,7 @@ import stable_baselines3 as sb3
 try:
     from torch.utils.tensorboard import SummaryWriter
 except ImportError:
-    SummaryWriter = None
+    SummaryWriter = None  # type: ignore[misc, assignment]
 
 from stable_baselines3.common.logger import Logger, configure
 from stable_baselines3.common.type_aliases import GymEnv, Schedule, TensorDict, TrainFreq, TrainFrequencyUnit
@@ -43,7 +46,7 @@ def set_random_seed(seed: int, using_cuda: bool = False) -> None:
 
 
 # From stable baselines
-def explained_variance(y_pred: np.ndarray, y_true: np.ndarray) -> np.ndarray:
+def explained_variance(y_pred: np.ndarray, y_true: np.ndarray) -> float:
     """
     Computes fraction of variance that ypred explains about y.
     Returns 1 - Var[y-ypred] / Var[y]
@@ -59,7 +62,7 @@ def explained_variance(y_pred: np.ndarray, y_true: np.ndarray) -> np.ndarray:
     """
     assert y_true.ndim == 1 and y_pred.ndim == 1
     var_y = np.var(y_true)
-    return np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+    return np.nan if var_y == 0 else float(1 - np.var(y_true - y_pred) / var_y)
 
 
 def update_learning_rate(optimizer: th.optim.Optimizer, learning_rate: float) -> None:
@@ -67,21 +70,100 @@ def update_learning_rate(optimizer: th.optim.Optimizer, learning_rate: float) ->
     Update the learning rate for a given optimizer.
     Useful when doing linear schedule.
 
-    :param optimizer:
-    :param learning_rate:
+    :param optimizer: Pytorch optimizer
+    :param learning_rate: New learning rate value
     """
     for param_group in optimizer.param_groups:
         param_group["lr"] = learning_rate
 
 
-def get_schedule_fn(value_schedule: Union[Schedule, float, int]) -> Schedule:
+class FloatSchedule:
+    """
+    Wrapper that ensures the output of a Schedule is cast to float.
+    Can wrap either a constant value or an existing callable Schedule.
+
+    :param value_schedule: Constant value or callable schedule
+            (e.g. LinearSchedule, ConstantSchedule)
+    """
+
+    def __init__(self, value_schedule: Schedule | float):
+        if isinstance(value_schedule, FloatSchedule):
+            self.value_schedule: Schedule = value_schedule.value_schedule
+        elif isinstance(value_schedule, (float, int)):
+            self.value_schedule = ConstantSchedule(float(value_schedule))
+        else:
+            assert callable(value_schedule), f"The learning rate schedule must be a float or a callable, not {value_schedule}"
+            self.value_schedule = value_schedule
+
+    def __call__(self, progress_remaining: float) -> float:
+        # Cast to float to avoid unpickling errors to enable weights_only=True, see GH#1900
+        # Some types are have odd behaviors when part of a Schedule, like numpy floats
+        return float(self.value_schedule(progress_remaining))
+
+    def __repr__(self) -> str:
+        return f"FloatSchedule({self.value_schedule})"
+
+
+class LinearSchedule:
+    """
+    LinearSchedule interpolates linearly between start and end
+    between ``progress_remaining`` = 1 and ``progress_remaining`` = ``end_fraction``.
+    This is used in DQN for linearly annealing the exploration fraction
+    (epsilon for the epsilon-greedy strategy).
+
+    :param start: value to start with if ``progress_remaining`` = 1
+    :param end: value to end with if ``progress_remaining`` = 0
+    :param end_fraction: fraction of ``progress_remaining``  where end is reached e.g 0.1
+        then end is reached after 10% of the complete training process.
+    """
+
+    def __init__(self, start: float, end: float, end_fraction: float) -> None:
+        self.start = start
+        self.end = end
+        self.end_fraction = end_fraction
+
+    def __call__(self, progress_remaining: float) -> float:
+        if (1 - progress_remaining) > self.end_fraction:
+            return self.end
+        else:
+            return self.start + (1 - progress_remaining) * (self.end - self.start) / self.end_fraction
+
+    def __repr__(self) -> str:
+        return f"LinearSchedule(start={self.start}, end={self.end}, end_fraction={self.end_fraction})"
+
+
+class ConstantSchedule:
+    """
+    Constant schedule that always returns the same value.
+    Useful for fixed learning rates or clip ranges.
+
+    :param val: constant value
+    """
+
+    def __init__(self, val: float):
+        self.val = val
+
+    def __call__(self, _: float) -> float:
+        return self.val
+
+    def __repr__(self) -> str:
+        return f"ConstantSchedule(val={self.val})"
+
+
+# ===== Deprecated schedule functions ====
+# only kept for backward compatibility when unpickling old models, use FloatSchedule
+# and other classes like `LinearSchedule() instead
+
+
+def get_schedule_fn(value_schedule: Schedule | float) -> Schedule:
     """
     Transform (if needed) learning rate and clip range (for PPO)
     to callable.
 
-    :param value_schedule:
-    :return:
+    :param value_schedule: Constant value of schedule function
+    :return: Schedule function (can return constant value)
     """
+    warnings.warn("get_schedule_fn() is deprecated, please use FloatSchedule() instead")
     # If the passed schedule is a float
     # create a constant function
     if isinstance(value_schedule, (float, int)):
@@ -89,7 +171,9 @@ def get_schedule_fn(value_schedule: Union[Schedule, float, int]) -> Schedule:
         value_schedule = constant_fn(float(value_schedule))
     else:
         assert callable(value_schedule)
-    return value_schedule
+    # Cast to float to avoid unpickling errors to enable weights_only=True, see GH#1900
+    # Some types are have odd behaviors when part of a Schedule, like numpy floats
+    return lambda progress_remaining: float(value_schedule(progress_remaining))
 
 
 def get_linear_fn(start: float, end: float, end_fraction: float) -> Schedule:
@@ -104,8 +188,9 @@ def get_linear_fn(start: float, end: float, end_fraction: float) -> Schedule:
     :params end_fraction: fraction of ``progress_remaining``
         where end is reached e.g 0.1 then end is reached after 10%
         of the complete training process.
-    :return:
+    :return: Linear schedule function.
     """
+    warnings.warn("get_linear_fn() is deprecated, please use LinearSchedule() instead")
 
     def func(progress_remaining: float) -> float:
         if (1 - progress_remaining) > end_fraction:
@@ -121,9 +206,10 @@ def constant_fn(val: float) -> Schedule:
     Create a function that returns a constant
     It is useful for learning rate schedule (to avoid code duplication)
 
-    :param val:
-    :return:
+    :param val: constant value
+    :return: Constant schedule function.
     """
+    warnings.warn("constant_fn() is deprecated, please use ConstantSchedule() instead")
 
     def func(_):
         return val
@@ -131,7 +217,10 @@ def constant_fn(val: float) -> Schedule:
     return func
 
 
-def get_device(device: Union[th.device, str] = "auto") -> th.device:
+# ==== End of deprecated schedule functions ====
+
+
+def get_device(device: th.device | str = "auto") -> th.device:
     """
     Retrieve PyTorch device.
     It checks that the requested device is available first.
@@ -139,7 +228,7 @@ def get_device(device: Union[th.device, str] = "auto") -> th.device:
     By default, it tries to use the gpu.
 
     :param device: One for 'auto', 'cuda', 'cpu'
-    :return:
+    :return: Supported Pytorch device
     """
     # Cuda by default
     if device == "auto":
@@ -154,15 +243,18 @@ def get_device(device: Union[th.device, str] = "auto") -> th.device:
     return device
 
 
-def get_latest_run_id(log_path: Optional[str] = None, log_name: str = "") -> int:
+def get_latest_run_id(log_path: str = "", log_name: str = "") -> int:
     """
     Returns the latest run number for the given log name and log path,
     by finding the greatest number in the directories.
 
+    :param log_path: Path to the log folder containing several runs.
+    :param log_name: Name of the experiment. Each run is stored
+        in a folder named ``log_name_1``, ``log_name_2``, ...
     :return: latest run number
     """
     max_run_id = 0
-    for path in glob.glob(f"{log_path}/{log_name}_[0-9]*"):
+    for path in glob.glob(os.path.join(log_path, f"{glob.escape(log_name)}_[0-9]*")):
         file_name = path.split(os.sep)[-1]
         ext = file_name.split("_")[-1]
         if log_name == "_".join(file_name.split("_")[:-1]) and ext.isdigit() and int(ext) > max_run_id:
@@ -172,14 +264,14 @@ def get_latest_run_id(log_path: Optional[str] = None, log_name: str = "") -> int
 
 def configure_logger(
     verbose: int = 0,
-    tensorboard_log: Optional[str] = None,
+    tensorboard_log: str | None = None,
     tb_log_name: str = "",
     reset_num_timesteps: bool = True,
 ) -> Logger:
     """
     Configure the logger's outputs.
 
-    :param verbose: the verbosity level: 0 no output, 1 info, 2 debug
+    :param verbose: Verbosity level: 0 for no output, 1 for the standard output to be part of the logger outputs
     :param tensorboard_log: the log location for tensorboard (if None, no logging)
     :param tb_log_name: tensorboard log
     :param reset_num_timesteps:  Whether the ``num_timesteps`` attribute is reset or not.
@@ -207,7 +299,7 @@ def configure_logger(
     return configure(save_path, format_strings=format_strings)
 
 
-def check_for_correct_spaces(env: GymEnv, observation_space: gym.spaces.Space, action_space: gym.spaces.Space) -> None:
+def check_for_correct_spaces(env: GymEnv, observation_space: spaces.Space, action_space: spaces.Space) -> None:
     """
     Checks that the environment has same spaces as provided ones. Used by BaseAlgorithm to check if
     spaces match after loading the model with given env.
@@ -225,7 +317,27 @@ def check_for_correct_spaces(env: GymEnv, observation_space: gym.spaces.Space, a
         raise ValueError(f"Action spaces do not match: {action_space} != {env.action_space}")
 
 
-def is_vectorized_box_observation(observation: np.ndarray, observation_space: gym.spaces.Box) -> bool:
+def check_shape_equal(space1: spaces.Space, space2: spaces.Space) -> None:
+    """
+    If the spaces are Box, check that they have the same shape.
+
+    If the spaces are Dict, it recursively checks the subspaces.
+
+    :param space1: Space
+    :param space2: Other space
+    """
+    if isinstance(space1, spaces.Dict):
+        assert isinstance(space2, spaces.Dict), f"spaces must be of the same type: {type(space1)} != {type(space2)}"
+        assert (
+            space1.spaces.keys() == space2.spaces.keys()
+        ), f"spaces must have the same keys: {list(space1.spaces.keys())} != {list(space2.spaces.keys())}"
+        for key in space1.spaces.keys():
+            check_shape_equal(space1.spaces[key], space2.spaces[key])
+    elif isinstance(space1, spaces.Box):
+        assert space1.shape == space2.shape, f"spaces must have the same shape: {space1.shape} != {space2.shape}"
+
+
+def is_vectorized_box_observation(observation: np.ndarray, observation_space: spaces.Box) -> bool:
     """
     For box observation type, detects and validates the shape,
     then returns whether or not the observation is vectorized.
@@ -246,7 +358,7 @@ def is_vectorized_box_observation(observation: np.ndarray, observation_space: gy
         )
 
 
-def is_vectorized_discrete_observation(observation: Union[int, np.ndarray], observation_space: gym.spaces.Discrete) -> bool:
+def is_vectorized_discrete_observation(observation: int | np.ndarray, observation_space: spaces.Discrete) -> bool:
     """
     For discrete observation type, detects and validates the shape,
     then returns whether or not the observation is vectorized.
@@ -266,7 +378,7 @@ def is_vectorized_discrete_observation(observation: Union[int, np.ndarray], obse
         )
 
 
-def is_vectorized_multidiscrete_observation(observation: np.ndarray, observation_space: gym.spaces.MultiDiscrete) -> bool:
+def is_vectorized_multidiscrete_observation(observation: np.ndarray, observation_space: spaces.MultiDiscrete) -> bool:
     """
     For multidiscrete observation type, detects and validates the shape,
     then returns whether or not the observation is vectorized.
@@ -287,7 +399,7 @@ def is_vectorized_multidiscrete_observation(observation: np.ndarray, observation
         )
 
 
-def is_vectorized_multibinary_observation(observation: np.ndarray, observation_space: gym.spaces.MultiBinary) -> bool:
+def is_vectorized_multibinary_observation(observation: np.ndarray, observation_space: spaces.MultiBinary) -> bool:
     """
     For multibinary observation type, detects and validates the shape,
     then returns whether or not the observation is vectorized.
@@ -296,19 +408,19 @@ def is_vectorized_multibinary_observation(observation: np.ndarray, observation_s
     :param observation_space: the observation space
     :return: whether the given observation is vectorized or not
     """
-    if observation.shape == (observation_space.n,):
+    if observation.shape == observation_space.shape:
         return False
-    elif len(observation.shape) == 2 and observation.shape[1] == observation_space.n:
+    elif len(observation.shape) == len(observation_space.shape) + 1 and observation.shape[1:] == observation_space.shape:
         return True
     else:
         raise ValueError(
             f"Error: Unexpected observation shape {observation.shape} for MultiBinary "
-            + f"environment, please use ({observation_space.n},) or "
+            + f"environment, please use {observation_space.shape} or "
             + f"(n_env, {observation_space.n}) for the observation shape."
         )
 
 
-def is_vectorized_dict_observation(observation: np.ndarray, observation_space: gym.spaces.Dict) -> bool:
+def is_vectorized_dict_observation(observation: np.ndarray, observation_space: spaces.Dict) -> bool:
     """
     For dict observation type, detects and validates the shape,
     then returns whether or not the observation is vectorized.
@@ -352,7 +464,7 @@ def is_vectorized_dict_observation(observation: np.ndarray, observation_space: g
         )
 
 
-def is_vectorized_observation(observation: Union[int, np.ndarray], observation_space: gym.spaces.Space) -> bool:
+def is_vectorized_observation(observation: int | np.ndarray, observation_space: spaces.Space) -> bool:
     """
     For every observation type, detects and validates the shape,
     then returns whether or not the observation is vectorized.
@@ -363,53 +475,61 @@ def is_vectorized_observation(observation: Union[int, np.ndarray], observation_s
     """
 
     is_vec_obs_func_dict = {
-        gym.spaces.Box: is_vectorized_box_observation,
-        gym.spaces.Discrete: is_vectorized_discrete_observation,
-        gym.spaces.MultiDiscrete: is_vectorized_multidiscrete_observation,
-        gym.spaces.MultiBinary: is_vectorized_multibinary_observation,
-        gym.spaces.Dict: is_vectorized_dict_observation,
+        spaces.Box: is_vectorized_box_observation,
+        spaces.Discrete: is_vectorized_discrete_observation,
+        spaces.MultiDiscrete: is_vectorized_multidiscrete_observation,
+        spaces.MultiBinary: is_vectorized_multibinary_observation,
+        spaces.Dict: is_vectorized_dict_observation,
     }
 
     for space_type, is_vec_obs_func in is_vec_obs_func_dict.items():
         if isinstance(observation_space, space_type):
-            return is_vec_obs_func(observation, observation_space)
+            return is_vec_obs_func(observation, observation_space)  # type: ignore[operator]
     else:
         # for-else happens if no break is called
         raise ValueError(f"Error: Cannot determine if the observation is vectorized with the space type {observation_space}.")
 
 
-def safe_mean(arr: Union[np.ndarray, list, deque]) -> np.ndarray:
+def safe_mean(arr: np.ndarray | list | deque) -> float:
     """
     Compute the mean of an array if there is at least one element.
     For empty array, return NaN. It is used for logging only.
 
-    :param arr:
+    :param arr: Numpy array or list of values
     :return:
     """
-    return np.nan if len(arr) == 0 else np.mean(arr)
+    return np.nan if len(arr) == 0 else float(np.mean(arr))  # type: ignore[arg-type]
+
+
+def get_parameters_by_name(model: th.nn.Module, included_names: Iterable[str]) -> list[th.Tensor]:
+    """
+    Extract parameters from the state dict of ``model``
+    if the name contains one of the strings in ``included_names``.
+
+    :param model: the model where the parameters come from.
+    :param included_names: substrings of names to include.
+    :return: List of parameters values (Pytorch tensors)
+        that matches the queried names.
+    """
+    return [param for name, param in model.state_dict().items() if any([key in name for key in included_names])]
 
 
 def zip_strict(*iterables: Iterable) -> Iterable:
     r"""
     ``zip()`` function but enforces that iterables are of equal length.
     Raises ``ValueError`` if iterables not of equal length.
-    Code inspired by Stackoverflow answer for question #32954486.
+    It used to be a polyfill for Python 3.19 taken from Stackoverflow #32954486.
+    Since Python 3.10 is the minimum version, it is kept only for legacy
+    and is just returning zip(..., strict=True).
 
     :param \*iterables: iterables to ``zip()``
     """
-    # As in Stackoverflow #32954486, use
-    # new object for "empty" in case we have
-    # Nones in iterable.
-    sentinel = object()
-    for combo in zip_longest(*iterables, fillvalue=sentinel):
-        if sentinel in combo:
-            raise ValueError("Iterables have different lengths")
-        yield combo
+    return zip(*iterables, strict=True)
 
 
 def polyak_update(
-    params: Iterable[th.nn.Parameter],
-    target_params: Iterable[th.nn.Parameter],
+    params: Iterable[th.Tensor],
+    target_params: Iterable[th.Tensor],
     tau: float,
 ) -> None:
     """
@@ -428,15 +548,12 @@ def polyak_update(
     :param tau: the soft update coefficient ("Polyak update", between 0 and 1)
     """
     with th.no_grad():
-        # zip does not raise an exception if length of parameters does not match.
-        for param, target_param in zip_strict(params, target_params):
+        for param, target_param in zip(params, target_params, strict=True):
             target_param.data.mul_(1 - tau)
             th.add(target_param.data, param.data, alpha=tau, out=target_param.data)
 
 
-def obs_as_tensor(
-    obs: Union[np.ndarray, Dict[Union[str, int], np.ndarray]], device: th.device
-) -> Union[th.Tensor, TensorDict]:
+def obs_as_tensor(obs: np.ndarray | dict[str, np.ndarray], device: th.device) -> th.Tensor | TensorDict:
     """
     Moves the observation to the given device.
 
@@ -445,11 +562,11 @@ def obs_as_tensor(
     :return: PyTorch tensor of the observation on a desired device.
     """
     if isinstance(obs, np.ndarray):
-        return th.as_tensor(obs).to(device)
+        return th.as_tensor(obs, device=device)
     elif isinstance(obs, dict):
-        return {key: th.as_tensor(_obs).to(device) for (key, _obs) in obs.items()}
+        return {key: th.as_tensor(_obs, device=device) for (key, _obs) in obs.items()}
     else:
-        raise Exception(f"Unrecognized type of observation {type(obs)}")
+        raise TypeError(f"Unrecognized type of observation {type(obs)}")
 
 
 def should_collect_more_steps(
@@ -480,7 +597,7 @@ def should_collect_more_steps(
         )
 
 
-def get_system_info(print_info: bool = True) -> Tuple[Dict[str, str], str]:
+def get_system_info(print_info: bool = True) -> tuple[dict[str, str], str]:
     """
     Retrieve system and python env info for the current system.
 
@@ -489,17 +606,27 @@ def get_system_info(print_info: bool = True) -> Tuple[Dict[str, str], str]:
         and a formatted string.
     """
     env_info = {
-        "OS": f"{platform.platform()} {platform.version()}",
+        # In OS, a regex is used to add a space between a "#" and a number to avoid
+        # wrongly linking to another issue on GitHub. Example: turn "#42" to "# 42".
+        "OS": re.sub(r"#(\d)", r"# \1", f"{platform.platform()} {platform.version()}"),
         "Python": platform.python_version(),
         "Stable-Baselines3": sb3.__version__,
         "PyTorch": th.__version__,
         "GPU Enabled": str(th.cuda.is_available()),
         "Numpy": np.__version__,
-        "Gym": gym.__version__,
+        "Cloudpickle": cloudpickle.__version__,
+        "Gymnasium": gym.__version__,
     }
+    try:
+        import gym as openai_gym
+
+        env_info.update({"OpenAI Gym": openai_gym.__version__})
+    except ImportError:
+        pass
+
     env_info_str = ""
     for key, value in env_info.items():
-        env_info_str += f"{key}: {value}\n"
+        env_info_str += f"- {key}: {value}\n"
     if print_info:
         print(env_info_str)
     return env_info, env_info_str

@@ -1,9 +1,8 @@
 import warnings
-from typing import Dict, Tuple, Union
 
 import numpy as np
 import torch as th
-from gym import spaces
+from gymnasium import spaces
 from torch.nn import functional as F
 
 
@@ -27,6 +26,7 @@ def is_image_space_channels_first(observation_space: spaces.Box) -> bool:
 def is_image_space(
     observation_space: spaces.Space,
     check_channels: bool = False,
+    normalized_image: bool = False,
 ) -> bool:
     """
     Check if a observation space has the shape, limits and dtype
@@ -38,15 +38,21 @@ def is_image_space(
     :param observation_space:
     :param check_channels: Whether to do or not the check for the number of channels.
         e.g., with frame-stacking, the observation space may have more channels than expected.
+    :param normalized_image: Whether to assume that the image is already normalized
+        or not (this disables dtype and bounds checks): when True, it only checks that
+        the space is a Box and has 3 dimensions.
+        Otherwise, it checks that it has expected dtype (uint8) and bounds (values in [0, 255]).
     :return:
     """
+    check_dtype = check_bounds = not normalized_image
     if isinstance(observation_space, spaces.Box) and len(observation_space.shape) == 3:
         # Check the type
-        if observation_space.dtype != np.uint8:
+        if check_dtype and observation_space.dtype != np.uint8:
             return False
 
         # Check the value range
-        if np.any(observation_space.low != 0) or np.any(observation_space.high != 255):
+        incorrect_bounds = np.any(observation_space.low != 0) or np.any(observation_space.high != 255)
+        if check_bounds and incorrect_bounds:
             return False
 
         # Skip channels check
@@ -57,7 +63,7 @@ def is_image_space(
             n_channels = observation_space.shape[0]
         else:
             n_channels = observation_space.shape[-1]
-        # RGB, RGBD, GrayScale
+        # GrayScale, RGB, RGBD
         return n_channels in [1, 3, 4]
     return False
 
@@ -83,10 +89,10 @@ def maybe_transpose(observation: np.ndarray, observation_space: spaces.Space) ->
 
 
 def preprocess_obs(
-    obs: th.Tensor,
+    obs: th.Tensor | dict[str, th.Tensor],
     observation_space: spaces.Space,
     normalize_images: bool = True,
-) -> Union[th.Tensor, Dict[str, th.Tensor]]:
+) -> th.Tensor | dict[str, th.Tensor]:
     """
     Preprocess observation to be to a neural network.
     For images, it normalizes the values by dividing them by 255 (to have values in [0, 1])
@@ -98,14 +104,24 @@ def preprocess_obs(
         (True by default)
     :return:
     """
+    if isinstance(observation_space, spaces.Dict):
+        # Do not modify by reference the original observation
+        assert isinstance(obs, dict), f"Expected dict, got {type(obs)}"
+        preprocessed_obs = {}
+        for key, _obs in obs.items():
+            preprocessed_obs[key] = preprocess_obs(_obs, observation_space[key], normalize_images=normalize_images)
+        return preprocessed_obs  # type: ignore[return-value]
+
+    assert isinstance(obs, th.Tensor), f"Expecting a torch Tensor, but got {type(obs)}"
+
     if isinstance(observation_space, spaces.Box):
-        if is_image_space(observation_space) and normalize_images:
+        if normalize_images and is_image_space(observation_space):
             return obs.float() / 255.0
         return obs.float()
 
     elif isinstance(observation_space, spaces.Discrete):
         # One hot encoding and convert to float to avoid errors
-        return F.one_hot(obs.long(), num_classes=observation_space.n).float()
+        return F.one_hot(obs.long(), num_classes=int(observation_space.n)).float()
 
     elif isinstance(observation_space, spaces.MultiDiscrete):
         # Tensor concatenation of one hot encodings of each Categorical sub-space
@@ -119,21 +135,13 @@ def preprocess_obs(
 
     elif isinstance(observation_space, spaces.MultiBinary):
         return obs.float()
-
-    elif isinstance(observation_space, spaces.Dict):
-        # Do not modify by reference the original observation
-        preprocessed_obs = {}
-        for key, _obs in obs.items():
-            preprocessed_obs[key] = preprocess_obs(_obs, observation_space[key], normalize_images=normalize_images)
-        return preprocessed_obs
-
     else:
         raise NotImplementedError(f"Preprocessing not implemented for {observation_space}")
 
 
 def get_obs_shape(
     observation_space: spaces.Space,
-) -> Union[Tuple[int, ...], Dict[str, Tuple[int, ...]]]:
+) -> tuple[int, ...] | dict[str, tuple[int, ...]]:
     """
     Get the shape of the observation (useful for the buffers).
 
@@ -147,12 +155,12 @@ def get_obs_shape(
         return (1,)
     elif isinstance(observation_space, spaces.MultiDiscrete):
         # Number of discrete features
-        return (int(len(observation_space.nvec)),)
+        return (len(observation_space.nvec),)
     elif isinstance(observation_space, spaces.MultiBinary):
         # Number of binary features
-        return (int(observation_space.n),)
+        return observation_space.shape
     elif isinstance(observation_space, spaces.Dict):
-        return {key: get_obs_shape(subspace) for (key, subspace) in observation_space.spaces.items()}
+        return {key: get_obs_shape(subspace) for (key, subspace) in observation_space.spaces.items()}  # type: ignore[misc]
 
     else:
         raise NotImplementedError(f"{observation_space} observation space is not supported")
@@ -191,21 +199,23 @@ def get_action_dim(action_space: spaces.Space) -> int:
         return 1
     elif isinstance(action_space, spaces.MultiDiscrete):
         # Number of discrete actions
-        return int(len(action_space.nvec))
+        return len(action_space.nvec)
     elif isinstance(action_space, spaces.MultiBinary):
         # Number of binary actions
+        assert isinstance(
+            action_space.n, int
+        ), f"Multi-dimensional MultiBinary({action_space.n}) action space is not supported. You can flatten it instead."
         return int(action_space.n)
     else:
         raise NotImplementedError(f"{action_space} action space is not supported")
 
 
-def check_for_nested_spaces(obs_space: spaces.Space):
+def check_for_nested_spaces(obs_space: spaces.Space) -> None:
     """
     Make sure the observation space does not have nested spaces (Dicts/Tuples inside Dicts/Tuples).
     If so, raise an Exception informing that there is no support for this.
 
     :param obs_space: an observation space
-    :return:
     """
     if isinstance(obs_space, (spaces.Dict, spaces.Tuple)):
         sub_spaces = obs_space.spaces.values() if isinstance(obs_space, spaces.Dict) else obs_space.spaces

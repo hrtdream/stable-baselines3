@@ -5,17 +5,25 @@ import sys
 import tempfile
 import warnings
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Sequence, TextIO, Tuple, Union
+from collections.abc import Mapping, Sequence
+from io import TextIOBase
+from typing import Any, TextIO
 
+import matplotlib.figure
 import numpy as np
 import pandas
 import torch as th
-from matplotlib import pyplot as plt
 
 try:
     from torch.utils.tensorboard import SummaryWriter
+    from torch.utils.tensorboard.summary import hparams
 except ImportError:
-    SummaryWriter = None
+    SummaryWriter = None  # type: ignore[misc, assignment]
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 
 DEBUG = 10
 INFO = 20
@@ -24,7 +32,7 @@ ERROR = 40
 DISABLED = 50
 
 
-class Video(object):
+class Video:
     """
     Video data class storing the video frames and the frame per seconds
 
@@ -32,12 +40,12 @@ class Video(object):
     :param fps: frames per second
     """
 
-    def __init__(self, frames: th.Tensor, fps: Union[float, int]):
+    def __init__(self, frames: th.Tensor, fps: float):
         self.frames = frames
         self.fps = fps
 
 
-class Figure(object):
+class Figure:
     """
     Figure data class storing a matplotlib figure and whether to close the figure after logging it
 
@@ -45,12 +53,12 @@ class Figure(object):
     :param close: if true, close the figure after logging it
     """
 
-    def __init__(self, figure: plt.figure, close: bool):
+    def __init__(self, figure: matplotlib.figure.Figure, close: bool):
         self.figure = figure
         self.close = close
 
 
-class Image(object):
+class Image:
     """
     Image data class storing an image and data format
 
@@ -60,29 +68,54 @@ class Image(object):
         Gym envs normally use 'HWC' (channel last)
     """
 
-    def __init__(self, image: Union[th.Tensor, np.ndarray, str], dataformats: str):
+    def __init__(self, image: th.Tensor | np.ndarray | str, dataformats: str):
         self.image = image
         self.dataformats = dataformats
 
 
+class HParam:
+    """
+    Hyperparameter data class storing hyperparameters and metrics in dictionaries
+
+    :param hparam_dict: key-value pairs of hyperparameters to log
+    :param metric_dict: key-value pairs of metrics to log
+        A non-empty metrics dict is required to display hyperparameters in the corresponding Tensorboard section.
+    """
+
+    def __init__(self, hparam_dict: Mapping[str, bool | str | float | None], metric_dict: Mapping[str, float]):
+        self.hparam_dict = hparam_dict
+        if not metric_dict:
+            raise Exception("`metric_dict` must not be empty to display hyperparameters to the HPARAMS tensorboard tab.")
+        self.metric_dict = metric_dict
+
+
 class FormatUnsupportedError(NotImplementedError):
+    """
+    Custom error to display informative message when
+    a value is not supported by some formats.
+
+    :param unsupported_formats: A sequence of unsupported formats,
+        for instance ``["stdout"]``.
+    :param value_description: Description of the value that cannot be logged by this format.
+    """
+
     def __init__(self, unsupported_formats: Sequence[str], value_description: str):
         if len(unsupported_formats) > 1:
             format_str = f"formats {', '.join(unsupported_formats)} are"
         else:
             format_str = f"format {unsupported_formats[0]} is"
-        super(FormatUnsupportedError, self).__init__(
+        super().__init__(
             f"The {format_str} not supported for the {value_description} value logged.\n"
             f"You can exclude formats via the `exclude` parameter of the logger's `record` function."
         )
 
 
-class KVWriter(object):
+class KVWriter:
     """
     Key Value writer
     """
 
-    def write(self, key_values: Dict[str, Any], key_excluded: Dict[str, Union[str, Tuple[str, ...]]], step: int = 0) -> None:
+    def write(self, key_values: dict[str, Any], key_excluded: dict[str, tuple[str, ...]], step: int = 0) -> None:
         """
         Write a dictionary to file
 
@@ -99,12 +132,12 @@ class KVWriter(object):
         raise NotImplementedError
 
 
-class SeqWriter(object):
+class SeqWriter:
     """
     sequence writer
     """
 
-    def write_sequence(self, sequence: List) -> None:
+    def write_sequence(self, sequence: list[str]) -> None:
         """
         write_sequence an array to file
 
@@ -114,26 +147,37 @@ class SeqWriter(object):
 
 
 class HumanOutputFormat(KVWriter, SeqWriter):
-    def __init__(self, filename_or_file: Union[str, TextIO]):
-        """
-        log to a file, in a human readable format
+    """A human-readable output format producing ASCII tables of key-value pairs.
 
-        :param filename_or_file: the file to write the log to
-        """
+    Set attribute ``max_length`` to change the maximum length of keys and values
+    to write to output (or specify it when calling ``__init__``).
+
+    :param filename_or_file: the file to write the log to
+    :param max_length: the maximum length of keys and values to write to output.
+        Outputs longer than this will be truncated. An error will be raised
+        if multiple keys are truncated to the same value. The maximum output
+        width will be ``2*max_length + 7``. The default of 36 produces output
+        no longer than 79 characters wide.
+    """
+
+    def __init__(self, filename_or_file: str | TextIO, max_length: int = 36):
+        self.max_length = max_length
         if isinstance(filename_or_file, str):
-            self.file = open(filename_or_file, "wt")
+            self.file = open(filename_or_file, "w")
             self.own_file = True
-        else:
-            assert hasattr(filename_or_file, "write"), f"Expected file or str, got {filename_or_file}"
-            self.file = filename_or_file
+        elif isinstance(filename_or_file, TextIOBase) or hasattr(filename_or_file, "write"):
+            # Note: in theory `TextIOBase` check should be sufficient,
+            # in practice, libraries don't always inherit from it, see GH#1598
+            self.file = filename_or_file  # type: ignore[assignment]
             self.own_file = False
+        else:
+            raise ValueError(f"Expected file or str, got {filename_or_file}")
 
-    def write(self, key_values: Dict, key_excluded: Dict, step: int = 0) -> None:
+    def write(self, key_values: dict[str, Any], key_excluded: dict[str, tuple[str, ...]], step: int = 0) -> None:
         # Create strings for printing
         key2str = {}
-        tag = None
-        for (key, value), (_, excluded) in zip(sorted(key_values.items()), sorted(key_excluded.items())):
-
+        tag = ""
+        for (key, value), (_, excluded) in zip(sorted(key_values.items()), sorted(key_excluded.items()), strict=True):
             if excluded is not None and ("stdout" in excluded or "log" in excluded):
                 continue
 
@@ -146,6 +190,9 @@ class HumanOutputFormat(KVWriter, SeqWriter):
             elif isinstance(value, Image):
                 raise FormatUnsupportedError(["stdout", "log"], "image")
 
+            elif isinstance(value, HParam):
+                raise FormatUnsupportedError(["stdout", "log"], "hparam")
+
             elif isinstance(value, float):
                 # Align left
                 value_str = f"{value:<8.3g}"
@@ -154,40 +201,51 @@ class HumanOutputFormat(KVWriter, SeqWriter):
 
             if key.find("/") > 0:  # Find tag and add it to the dict
                 tag = key[: key.find("/") + 1]
-                key2str[self._truncate(tag)] = ""
-            # Remove tag from key
-            if tag is not None and tag in key:
-                key = str("   " + key[len(tag) :])
+                key2str[(tag, self._truncate(tag))] = ""
+            # Remove tag from key and indent the key
+            if len(tag) > 0 and tag in key:
+                key = f"{'':3}{key[len(tag) :]}"
 
-            key2str[self._truncate(key)] = self._truncate(value_str)
+            truncated_key = self._truncate(key)
+            if (tag, truncated_key) in key2str:
+                raise ValueError(
+                    f"Key '{key}' truncated to '{truncated_key}' that already exists. Consider increasing `max_length`."
+                )
+            key2str[(tag, truncated_key)] = self._truncate(value_str)
 
         # Find max widths
         if len(key2str) == 0:
             warnings.warn("Tried to write empty key-value dict")
             return
         else:
-            key_width = max(map(len, key2str.keys()))
+            tagless_keys = map(lambda x: x[1], key2str.keys())
+            key_width = max(map(len, tagless_keys))
             val_width = max(map(len, key2str.values()))
 
         # Write out the data
         dashes = "-" * (key_width + val_width + 7)
         lines = [dashes]
-        for key, value in key2str.items():
+        for (_, key), value in key2str.items():
             key_space = " " * (key_width - len(key))
             val_space = " " * (val_width - len(value))
             lines.append(f"| {key}{key_space} | {value}{val_space} |")
         lines.append(dashes)
-        self.file.write("\n".join(lines) + "\n")
+
+        if tqdm is not None and hasattr(self.file, "name") and self.file.name == "<stdout>":
+            # Do not mess up with progress bar
+            tqdm.write("\n".join(lines) + "\n", file=sys.stdout, end="")
+        else:
+            self.file.write("\n".join(lines) + "\n")
 
         # Flush the output to the file
         self.file.flush()
 
-    @classmethod
-    def _truncate(cls, string: str, max_length: int = 23) -> str:
-        return string[: max_length - 3] + "..." if len(string) > max_length else string
+    def _truncate(self, string: str) -> str:
+        if len(string) > self.max_length:
+            string = string[: self.max_length - 3] + "..."
+        return string
 
-    def write_sequence(self, sequence: List) -> None:
-        sequence = list(sequence)
+    def write_sequence(self, sequence: list[str]) -> None:
         for i, elem in enumerate(sequence):
             self.file.write(elem)
             if i < len(sequence) - 1:  # add space unless this is the last one
@@ -203,9 +261,7 @@ class HumanOutputFormat(KVWriter, SeqWriter):
             self.file.close()
 
 
-def filter_excluded_keys(
-    key_values: Dict[str, Any], key_excluded: Dict[str, Union[str, Tuple[str, ...]]], _format: str
-) -> Dict[str, Any]:
+def filter_excluded_keys(key_values: dict[str, Any], key_excluded: dict[str, tuple[str, ...]], _format: str) -> dict[str, Any]:
     """
     Filters the keys specified by ``key_exclude`` for the specified format
 
@@ -222,15 +278,16 @@ def filter_excluded_keys(
 
 
 class JSONOutputFormat(KVWriter):
+    """
+    Log to a file, in the JSON format
+
+    :param filename: the file to write the log to
+    """
+
     def __init__(self, filename: str):
-        """
-        log to a file, in the JSON format
+        self.file = open(filename, "w")
 
-        :param filename: the file to write the log to
-        """
-        self.file = open(filename, "wt")
-
-    def write(self, key_values: Dict[str, Any], key_excluded: Dict[str, Union[str, Tuple[str, ...]]], step: int = 0) -> None:
+    def write(self, key_values: dict[str, Any], key_excluded: dict[str, tuple[str, ...]], step: int = 0) -> None:
         def cast_to_json_serializable(value: Any):
             if isinstance(value, Video):
                 raise FormatUnsupportedError(["json"], "video")
@@ -238,10 +295,12 @@ class JSONOutputFormat(KVWriter):
                 raise FormatUnsupportedError(["json"], "figure")
             if isinstance(value, Image):
                 raise FormatUnsupportedError(["json"], "image")
+            if isinstance(value, HParam):
+                raise FormatUnsupportedError(["json"], "hparam")
             if hasattr(value, "dtype"):
                 if value.shape == () or len(value) == 1:
                     # if value is a dimensionless numpy array or of length 1, serialize as a float
-                    return float(value)
+                    return float(value.item())
                 else:
                     # otherwise, a value is a numpy array, serialize as a list or nested lists
                     return value.tolist()
@@ -263,19 +322,19 @@ class JSONOutputFormat(KVWriter):
 
 
 class CSVOutputFormat(KVWriter):
+    """
+    Log to a file, in a CSV format
+
+    :param filename: the file to write the log to
+    """
+
     def __init__(self, filename: str):
-        """
-        log to a file, in a CSV format
-
-        :param filename: the file to write the log to
-        """
-
-        self.file = open(filename, "w+t")
-        self.keys = []
+        self.file = open(filename, "w+")
+        self.keys: list[str] = []
         self.separator = ","
         self.quotechar = '"'
 
-    def write(self, key_values: Dict[str, Any], key_excluded: Dict[str, Union[str, Tuple[str, ...]]], step: int = 0) -> None:
+    def write(self, key_values: dict[str, Any], key_excluded: dict[str, tuple[str, ...]], step: int = 0) -> None:
         # Add our current row to the history
         key_values = filter_excluded_keys(key_values, key_excluded, "csv")
         extra_keys = key_values.keys() - self.keys
@@ -284,7 +343,7 @@ class CSVOutputFormat(KVWriter):
             self.file.seek(0)
             lines = self.file.readlines()
             self.file.seek(0)
-            for (i, key) in enumerate(self.keys):
+            for i, key in enumerate(self.keys):
                 if i > 0:
                     self.file.write(",")
                 self.file.write(key)
@@ -307,6 +366,9 @@ class CSVOutputFormat(KVWriter):
             elif isinstance(value, Image):
                 raise FormatUnsupportedError(["csv"], "image")
 
+            elif isinstance(value, HParam):
+                raise FormatUnsupportedError(["csv"], "hparam")
+
             elif isinstance(value, str):
                 # escape quotechars by prepending them with another quotechar
                 value = value.replace(self.quotechar, self.quotechar + self.quotechar)
@@ -327,19 +389,20 @@ class CSVOutputFormat(KVWriter):
 
 
 class TensorBoardOutputFormat(KVWriter):
+    """
+    Dumps key/value pairs into TensorBoard's numeric format.
+
+    :param folder: the folder to write the log to
+    """
+
     def __init__(self, folder: str):
-        """
-        Dumps key/value pairs into TensorBoard's numeric format.
-
-        :param folder: the folder to write the log to
-        """
-        assert SummaryWriter is not None, "tensorboard is not installed, you can use " "pip install tensorboard to do so"
+        assert SummaryWriter is not None, "tensorboard is not installed, you can use `pip install tensorboard` to do so"
         self.writer = SummaryWriter(log_dir=folder)
+        self._is_closed = False
 
-    def write(self, key_values: Dict[str, Any], key_excluded: Dict[str, Union[str, Tuple[str, ...]]], step: int = 0) -> None:
-
-        for (key, value), (_, excluded) in zip(sorted(key_values.items()), sorted(key_excluded.items())):
-
+    def write(self, key_values: dict[str, Any], key_excluded: dict[str, tuple[str, ...]], step: int = 0) -> None:
+        assert not self._is_closed, "The SummaryWriter was closed, please re-create one."
+        for (key, value), (_, excluded) in zip(sorted(key_values.items()), sorted(key_excluded.items()), strict=True):
             if excluded is not None and "tensorboard" in excluded:
                 continue
 
@@ -350,8 +413,9 @@ class TensorBoardOutputFormat(KVWriter):
                 else:
                     self.writer.add_scalar(key, value, step)
 
-            if isinstance(value, th.Tensor):
-                self.writer.add_histogram(key, value, step)
+            if isinstance(value, (th.Tensor, np.ndarray)):
+                # Convert to Torch so it works with numpy<1.24 and torch<2.0
+                self.writer.add_histogram(key, th.as_tensor(value), step)
 
             if isinstance(value, Video):
                 self.writer.add_video(key, value.frames, step, value.fps)
@@ -362,6 +426,13 @@ class TensorBoardOutputFormat(KVWriter):
             if isinstance(value, Image):
                 self.writer.add_image(key, value.image, step, dataformats=value.dataformats)
 
+            if isinstance(value, HParam):
+                # we don't use `self.writer.add_hparams` to have control over the log_dir
+                experiment, session_start_info, session_end_info = hparams(value.hparam_dict, metric_dict=value.metric_dict)
+                self.writer.file_writer.add_summary(experiment)
+                self.writer.file_writer.add_summary(session_start_info)
+                self.writer.file_writer.add_summary(session_end_info)
+
         # Flush the output to the file
         self.writer.flush()
 
@@ -371,7 +442,7 @@ class TensorBoardOutputFormat(KVWriter):
         """
         if self.writer:
             self.writer.close()
-            self.writer = None
+            self._is_closed = True
 
 
 def make_output_format(_format: str, log_dir: str, log_suffix: str = "") -> KVWriter:
@@ -403,7 +474,7 @@ def make_output_format(_format: str, log_dir: str, log_suffix: str = "") -> KVWr
 # ================================================================
 
 
-class Logger(object):
+class Logger:
     """
     The logger class.
 
@@ -411,15 +482,26 @@ class Logger(object):
     :param output_formats: the list of output formats
     """
 
-    def __init__(self, folder: Optional[str], output_formats: List[KVWriter]):
-        self.name_to_value = defaultdict(float)  # values this iteration
-        self.name_to_count = defaultdict(int)
-        self.name_to_excluded = defaultdict(str)
+    def __init__(self, folder: str | None, output_formats: list[KVWriter]):
+        self.name_to_value: dict[str, float] = defaultdict(float)  # values this iteration
+        self.name_to_count: dict[str, int] = defaultdict(int)
+        self.name_to_excluded: dict[str, tuple[str, ...]] = {}
         self.level = INFO
         self.dir = folder
         self.output_formats = output_formats
 
-    def record(self, key: str, value: Any, exclude: Optional[Union[str, Tuple[str, ...]]] = None) -> None:
+    @staticmethod
+    def to_tuple(string_or_tuple: str | tuple[str, ...] | None) -> tuple[str, ...]:
+        """
+        Helper function to convert str to tuple of str.
+        """
+        if string_or_tuple is None:
+            return ("",)
+        if isinstance(string_or_tuple, tuple):
+            return string_or_tuple
+        return (string_or_tuple,)
+
+    def record(self, key: str, value: Any, exclude: str | tuple[str, ...] | None = None) -> None:
         """
         Log a value of some diagnostic
         Call this once for each diagnostic quantity, each iteration
@@ -430,9 +512,9 @@ class Logger(object):
         :param exclude: outputs to be excluded
         """
         self.name_to_value[key] = value
-        self.name_to_excluded[key] = exclude
+        self.name_to_excluded[key] = self.to_tuple(exclude)
 
-    def record_mean(self, key: str, value: Any, exclude: Optional[Union[str, Tuple[str, ...]]] = None) -> None:
+    def record_mean(self, key: str, value: float | None, exclude: str | tuple[str, ...] | None = None) -> None:
         """
         The same as record(), but if called many times, values averaged.
 
@@ -441,12 +523,11 @@ class Logger(object):
         :param exclude: outputs to be excluded
         """
         if value is None:
-            self.name_to_value[key] = None
             return
         old_val, count = self.name_to_value[key], self.name_to_count[key]
         self.name_to_value[key] = old_val * count / (count + 1) + value / (count + 1)
         self.name_to_count[key] = count + 1
-        self.name_to_excluded[key] = exclude
+        self.name_to_excluded[key] = self.to_tuple(exclude)
 
     def dump(self, step: int = 0) -> None:
         """
@@ -526,7 +607,7 @@ class Logger(object):
         """
         self.level = level
 
-    def get_dir(self) -> str:
+    def get_dir(self) -> str | None:
         """
         Get directory that log files are being written to.
         will be None if there is no output directory (i.e., if you didn't call start)
@@ -544,7 +625,7 @@ class Logger(object):
 
     # Misc
     # ----------------------------------------
-    def _do_log(self, args) -> None:
+    def _do_log(self, args: tuple[Any, ...]) -> None:
         """
         log to the requested format outputs
 
@@ -552,10 +633,10 @@ class Logger(object):
         """
         for _format in self.output_formats:
             if isinstance(_format, SeqWriter):
-                _format.write_sequence(map(str, args))
+                _format.write_sequence(list(map(str, args)))
 
 
-def configure(folder: Optional[str] = None, format_strings: Optional[List[str]] = None) -> Logger:
+def configure(folder: str | None = None, format_strings: list[str] | None = None) -> Logger:
     """
     Configure the current logger.
 
@@ -599,7 +680,7 @@ def read_json(filename: str) -> pandas.DataFrame:
     :return: the data in the json
     """
     data = []
-    with open(filename, "rt") as file_handler:
+    with open(filename) as file_handler:
         for line in file_handler:
             data.append(json.loads(line))
     return pandas.DataFrame(data)

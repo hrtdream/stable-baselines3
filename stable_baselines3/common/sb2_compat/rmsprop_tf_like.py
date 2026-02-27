@@ -1,4 +1,5 @@
-from typing import Any, Callable, Dict, Iterable, Optional
+from collections.abc import Callable, Iterable
+from typing import Any
 
 import torch
 from torch.optim import Optimizer
@@ -54,27 +55,27 @@ class RMSpropTFLike(Optimizer):
         centered: bool = False,
     ):
         if not 0.0 <= lr:
-            raise ValueError("Invalid learning rate: {}".format(lr))
+            raise ValueError(f"Invalid learning rate: {lr}")
         if not 0.0 <= eps:
-            raise ValueError("Invalid epsilon value: {}".format(eps))
+            raise ValueError(f"Invalid epsilon value: {eps}")
         if not 0.0 <= momentum:
-            raise ValueError("Invalid momentum value: {}".format(momentum))
+            raise ValueError(f"Invalid momentum value: {momentum}")
         if not 0.0 <= weight_decay:
-            raise ValueError("Invalid weight_decay value: {}".format(weight_decay))
+            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
         if not 0.0 <= alpha:
-            raise ValueError("Invalid alpha value: {}".format(alpha))
+            raise ValueError(f"Invalid alpha value: {alpha}")
 
         defaults = dict(lr=lr, momentum=momentum, alpha=alpha, eps=eps, centered=centered, weight_decay=weight_decay)
-        super(RMSpropTFLike, self).__init__(params, defaults)
+        super().__init__(params, defaults)
 
-    def __setstate__(self, state: Dict[str, Any]) -> None:
-        super(RMSpropTFLike, self).__setstate__(state)
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        super().__setstate__(state)
         for group in self.param_groups:
             group.setdefault("momentum", 0)
             group.setdefault("centered", False)
 
     @torch.no_grad()
-    def step(self, closure: Optional[Callable[[], None]] = None) -> Optional[torch.Tensor]:
+    def step(self, closure: Callable[[], float] | None = None) -> float | None:  # type: ignore[override]
         """Performs a single optimization step.
 
         :param closure: A closure that reevaluates the model

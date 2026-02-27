@@ -1,16 +1,19 @@
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, ClassVar, TypeVar
 
-import gym
 import numpy as np
 import torch as th
+from gymnasium import spaces
 from torch.nn import functional as F
 
 from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
+from stable_baselines3.common.policies import BasePolicy, ContinuousCritic
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
-from stable_baselines3.common.utils import polyak_update
-from stable_baselines3.td3.policies import TD3Policy
+from stable_baselines3.common.utils import get_parameters_by_name, polyak_update
+from stable_baselines3.td3.policies import Actor, CnnPolicy, MlpPolicy, MultiInputPolicy, TD3Policy
+
+SelfTD3 = TypeVar("SelfTD3", bound="TD3")
 
 
 class TD3(OffPolicyAlgorithm):
@@ -45,53 +48,66 @@ class TD3(OffPolicyAlgorithm):
     :param optimize_memory_usage: Enable a memory efficient variant of the replay buffer
         at a cost of more complexity.
         See https://github.com/DLR-RM/stable-baselines3/issues/37#issuecomment-637501195
+    :param n_steps: When n_step > 1, uses n-step return (with the NStepReplayBuffer) when updating the Q-value network.
     :param policy_delay: Policy and target networks will only be updated once every policy_delay steps
         per training steps. The Q values will be updated policy_delay more often (update every training step).
     :param target_policy_noise: Standard deviation of Gaussian noise added to target policy
         (smoothing noise)
     :param target_noise_clip: Limit for absolute value of target policy smoothing noise.
-    :param create_eval_env: Whether to create a second environment that will be
-        used for evaluating the agent periodically. (Only available when passing string for the environment)
-    :param policy_kwargs: additional arguments to be passed to the policy on creation
-    :param verbose: the verbosity level: 0 no output, 1 info, 2 debug
+    :param stats_window_size: Window size for the rollout logging, specifying the number of episodes to average
+        the reported success rate, mean episode length, and mean reward over
+    :param tensorboard_log: the log location for tensorboard (if None, no logging)
+    :param policy_kwargs: additional arguments to be passed to the policy on creation. See :ref:`td3_policies`
+    :param verbose: Verbosity level: 0 for no output, 1 for info messages (such as device or wrappers used), 2 for
+        debug messages
     :param seed: Seed for the pseudo random generators
     :param device: Device (cpu, cuda, ...) on which the code should be run.
         Setting it to auto, the code will be run on the GPU if possible.
     :param _init_setup_model: Whether or not to build the network at the creation of the instance
     """
 
+    policy_aliases: ClassVar[dict[str, type[BasePolicy]]] = {
+        "MlpPolicy": MlpPolicy,
+        "CnnPolicy": CnnPolicy,
+        "MultiInputPolicy": MultiInputPolicy,
+    }
+    policy: TD3Policy
+    actor: Actor
+    actor_target: Actor
+    critic: ContinuousCritic
+    critic_target: ContinuousCritic
+
     def __init__(
         self,
-        policy: Union[str, Type[TD3Policy]],
-        env: Union[GymEnv, str],
-        learning_rate: Union[float, Schedule] = 1e-3,
+        policy: str | type[TD3Policy],
+        env: GymEnv | str,
+        learning_rate: float | Schedule = 1e-3,
         buffer_size: int = 1_000_000,  # 1e6
         learning_starts: int = 100,
-        batch_size: int = 100,
+        batch_size: int = 256,
         tau: float = 0.005,
         gamma: float = 0.99,
-        train_freq: Union[int, Tuple[int, str]] = (1, "episode"),
-        gradient_steps: int = -1,
-        action_noise: Optional[ActionNoise] = None,
-        replay_buffer_class: Optional[ReplayBuffer] = None,
-        replay_buffer_kwargs: Optional[Dict[str, Any]] = None,
+        train_freq: int | tuple[int, str] = 1,
+        gradient_steps: int = 1,
+        action_noise: ActionNoise | None = None,
+        replay_buffer_class: type[ReplayBuffer] | None = None,
+        replay_buffer_kwargs: dict[str, Any] | None = None,
         optimize_memory_usage: bool = False,
+        n_steps: int = 1,
         policy_delay: int = 2,
         target_policy_noise: float = 0.2,
         target_noise_clip: float = 0.5,
-        tensorboard_log: Optional[str] = None,
-        create_eval_env: bool = False,
-        policy_kwargs: Optional[Dict[str, Any]] = None,
+        stats_window_size: int = 100,
+        tensorboard_log: str | None = None,
+        policy_kwargs: dict[str, Any] | None = None,
         verbose: int = 0,
-        seed: Optional[int] = None,
-        device: Union[th.device, str] = "auto",
+        seed: int | None = None,
+        device: th.device | str = "auto",
         _init_setup_model: bool = True,
     ):
-
-        super(TD3, self).__init__(
+        super().__init__(
             policy,
             env,
-            TD3Policy,
             learning_rate,
             buffer_size,
             learning_starts,
@@ -103,15 +119,16 @@ class TD3(OffPolicyAlgorithm):
             action_noise=action_noise,
             replay_buffer_class=replay_buffer_class,
             replay_buffer_kwargs=replay_buffer_kwargs,
+            optimize_memory_usage=optimize_memory_usage,
+            n_steps=n_steps,
             policy_kwargs=policy_kwargs,
+            stats_window_size=stats_window_size,
             tensorboard_log=tensorboard_log,
             verbose=verbose,
             device=device,
-            create_eval_env=create_eval_env,
             seed=seed,
             sde_support=False,
-            optimize_memory_usage=optimize_memory_usage,
-            supported_action_spaces=(gym.spaces.Box),
+            supported_action_spaces=(spaces.Box,),
             support_multi_env=True,
         )
 
@@ -123,8 +140,13 @@ class TD3(OffPolicyAlgorithm):
             self._setup_model()
 
     def _setup_model(self) -> None:
-        super(TD3, self)._setup_model()
+        super()._setup_model()
         self._create_aliases()
+        # Running mean and running var
+        self.actor_batch_norm_stats = get_parameters_by_name(self.actor, ["running_"])
+        self.critic_batch_norm_stats = get_parameters_by_name(self.critic, ["running_"])
+        self.actor_batch_norm_stats_target = get_parameters_by_name(self.actor_target, ["running_"])
+        self.critic_batch_norm_stats_target = get_parameters_by_name(self.critic_target, ["running_"])
 
     def _create_aliases(self) -> None:
         self.actor = self.policy.actor
@@ -140,12 +162,12 @@ class TD3(OffPolicyAlgorithm):
         self._update_learning_rate([self.actor.optimizer, self.critic.optimizer])
 
         actor_losses, critic_losses = [], []
-
         for _ in range(gradient_steps):
-
             self._n_updates += 1
             # Sample replay buffer
-            replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
+            replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)  # type: ignore[union-attr]
+            # For n-step replay, discount factor is gamma**n_steps (when no early termination)
+            discounts = replay_data.discounts if replay_data.discounts is not None else self.gamma
 
             with th.no_grad():
                 # Select action according to policy and add clipped noise
@@ -156,13 +178,14 @@ class TD3(OffPolicyAlgorithm):
                 # Compute the next Q-values: min over all critics targets
                 next_q_values = th.cat(self.critic_target(replay_data.next_observations, next_actions), dim=1)
                 next_q_values, _ = th.min(next_q_values, dim=1, keepdim=True)
-                target_q_values = replay_data.rewards + (1 - replay_data.dones) * self.gamma * next_q_values
+                target_q_values = replay_data.rewards + (1 - replay_data.dones) * discounts * next_q_values
 
             # Get current Q-values estimates for each critic network
             current_q_values = self.critic(replay_data.observations, replay_data.actions)
 
             # Compute critic loss
-            critic_loss = sum([F.mse_loss(current_q, target_q_values) for current_q in current_q_values])
+            critic_loss = sum(F.mse_loss(current_q, target_q_values) for current_q in current_q_values)
+            assert isinstance(critic_loss, th.Tensor)
             critic_losses.append(critic_loss.item())
 
             # Optimize the critics
@@ -183,6 +206,9 @@ class TD3(OffPolicyAlgorithm):
 
                 polyak_update(self.critic.parameters(), self.critic_target.parameters(), self.tau)
                 polyak_update(self.actor.parameters(), self.actor_target.parameters(), self.tau)
+                # Copy running stats, see GH issue #996
+                polyak_update(self.critic_batch_norm_stats, self.critic_batch_norm_stats_target, 1.0)
+                polyak_update(self.actor_batch_norm_stats, self.actor_batch_norm_stats_target, 1.0)
 
         self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
         if len(actor_losses) > 0:
@@ -229,33 +255,26 @@ class TD3(OffPolicyAlgorithm):
         # self.logger.record('actor/bn_bias', bn_bias_actor)
 
     def learn(
-        self,
+        self: SelfTD3,
         total_timesteps: int,
         callback: MaybeCallback = None,
         log_interval: int = 4,
-        eval_env: Optional[GymEnv] = None,
-        eval_freq: int = -1,
-        n_eval_episodes: int = 5,
         tb_log_name: str = "TD3",
-        eval_log_path: Optional[str] = None,
         reset_num_timesteps: bool = True,
-    ) -> OffPolicyAlgorithm:
-
-        return super(TD3, self).learn(
+        progress_bar: bool = False,
+    ) -> SelfTD3:
+        return super().learn(
             total_timesteps=total_timesteps,
             callback=callback,
             log_interval=log_interval,
-            eval_env=eval_env,
-            eval_freq=eval_freq,
-            n_eval_episodes=n_eval_episodes,
             tb_log_name=tb_log_name,
-            eval_log_path=eval_log_path,
             reset_num_timesteps=reset_num_timesteps,
+            progress_bar=progress_bar,
         )
 
-    def _excluded_save_params(self) -> List[str]:
-        return super(TD3, self)._excluded_save_params() + ["actor", "critic", "actor_target", "critic_target"]
+    def _excluded_save_params(self) -> list[str]:
+        return super()._excluded_save_params() + ["actor", "critic", "actor_target", "critic_target"]  # noqa: RUF005
 
-    def _get_torch_save_params(self) -> Tuple[List[str], List[str]]:
+    def _get_torch_save_params(self) -> tuple[list[str], list[str]]:
         state_dicts = ["policy", "actor.optimizer", "critic.optimizer"]
         return state_dicts, []

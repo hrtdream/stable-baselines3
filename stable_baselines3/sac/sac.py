@@ -1,16 +1,19 @@
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, ClassVar, TypeVar
 
-import gym
 import numpy as np
 import torch as th
+from gymnasium import spaces
 from torch.nn import functional as F
 
 from stable_baselines3.common.buffers import ReplayBuffer
 from stable_baselines3.common.noise import ActionNoise
 from stable_baselines3.common.off_policy_algorithm import OffPolicyAlgorithm
+from stable_baselines3.common.policies import BasePolicy, ContinuousCritic
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
-from stable_baselines3.common.utils import polyak_update
-from stable_baselines3.sac.policies import SACPolicy
+from stable_baselines3.common.utils import get_parameters_by_name, polyak_update
+from stable_baselines3.sac.policies import Actor, CnnPolicy, MlpPolicy, MultiInputPolicy, SACPolicy
+
+SelfSAC = TypeVar("SelfSAC", bound="SAC")
 
 
 class SAC(OffPolicyAlgorithm):
@@ -50,6 +53,7 @@ class SAC(OffPolicyAlgorithm):
     :param optimize_memory_usage: Enable a memory efficient variant of the replay buffer
         at a cost of more complexity.
         See https://github.com/DLR-RM/stable-baselines3/issues/37#issuecomment-637501195
+    :param n_steps: When n_step > 1, uses n-step return (with the NStepReplayBuffer) when updating the Q-value network.
     :param ent_coef: Entropy regularization coefficient. (Equivalent to
         inverse of reward scale in the original SAC paper.)  Controlling exploration/exploitation trade-off.
         Set it to 'auto' to learn it automatically (and 'auto_0.1' for using 0.1 as initial value)
@@ -62,51 +66,62 @@ class SAC(OffPolicyAlgorithm):
         Default: -1 (only sample at the beginning of the rollout)
     :param use_sde_at_warmup: Whether to use gSDE instead of uniform sampling
         during the warm up phase (before learning starts)
-    :param create_eval_env: Whether to create a second environment that will be
-        used for evaluating the agent periodically. (Only available when passing string for the environment)
-    :param policy_kwargs: additional arguments to be passed to the policy on creation
-    :param verbose: the verbosity level: 0 no output, 1 info, 2 debug
+    :param stats_window_size: Window size for the rollout logging, specifying the number of episodes to average
+        the reported success rate, mean episode length, and mean reward over
+    :param tensorboard_log: the log location for tensorboard (if None, no logging)
+    :param policy_kwargs: additional arguments to be passed to the policy on creation. See :ref:`sac_policies`
+    :param verbose: Verbosity level: 0 for no output, 1 for info messages (such as device or wrappers used), 2 for
+        debug messages
     :param seed: Seed for the pseudo random generators
     :param device: Device (cpu, cuda, ...) on which the code should be run.
         Setting it to auto, the code will be run on the GPU if possible.
     :param _init_setup_model: Whether or not to build the network at the creation of the instance
     """
 
+    policy_aliases: ClassVar[dict[str, type[BasePolicy]]] = {
+        "MlpPolicy": MlpPolicy,
+        "CnnPolicy": CnnPolicy,
+        "MultiInputPolicy": MultiInputPolicy,
+    }
+    policy: SACPolicy
+    actor: Actor
+    critic: ContinuousCritic
+    critic_target: ContinuousCritic
+
     def __init__(
         self,
-        policy: Union[str, Type[SACPolicy]],
-        env: Union[GymEnv, str],
-        learning_rate: Union[float, Schedule] = 3e-4,
+        policy: str | type[SACPolicy],
+        env: GymEnv | str,
+        learning_rate: float | Schedule = 3e-4,
         buffer_size: int = 1_000_000,  # 1e6
         learning_starts: int = 100,
         batch_size: int = 256,
         tau: float = 0.005,
         gamma: float = 0.99,
-        train_freq: Union[int, Tuple[int, str]] = 1,
+        train_freq: int | tuple[int, str] = 1,
         gradient_steps: int = 1,
-        action_noise: Optional[ActionNoise] = None,
-        replay_buffer_class: Optional[ReplayBuffer] = None,
-        replay_buffer_kwargs: Optional[Dict[str, Any]] = None,
+        action_noise: ActionNoise | None = None,
+        replay_buffer_class: type[ReplayBuffer] | None = None,
+        replay_buffer_kwargs: dict[str, Any] | None = None,
         optimize_memory_usage: bool = False,
-        ent_coef: Union[str, float] = "auto",
+        n_steps: int = 1,
+        ent_coef: str | float = "auto",
         target_update_interval: int = 1,
-        target_entropy: Union[str, float] = "auto",
+        target_entropy: str | float = "auto",
         use_sde: bool = False,
         sde_sample_freq: int = -1,
         use_sde_at_warmup: bool = False,
-        tensorboard_log: Optional[str] = None,
-        create_eval_env: bool = False,
-        policy_kwargs: Optional[Dict[str, Any]] = None,
+        stats_window_size: int = 100,
+        tensorboard_log: str | None = None,
+        policy_kwargs: dict[str, Any] | None = None,
         verbose: int = 0,
-        seed: Optional[int] = None,
-        device: Union[th.device, str] = "auto",
+        seed: int | None = None,
+        device: th.device | str = "auto",
         _init_setup_model: bool = True,
     ):
-
-        super(SAC, self).__init__(
+        super().__init__(
             policy,
             env,
-            SACPolicy,
             learning_rate,
             buffer_size,
             learning_starts,
@@ -118,38 +133,42 @@ class SAC(OffPolicyAlgorithm):
             action_noise,
             replay_buffer_class=replay_buffer_class,
             replay_buffer_kwargs=replay_buffer_kwargs,
+            optimize_memory_usage=optimize_memory_usage,
+            n_steps=n_steps,
             policy_kwargs=policy_kwargs,
+            stats_window_size=stats_window_size,
             tensorboard_log=tensorboard_log,
             verbose=verbose,
             device=device,
-            create_eval_env=create_eval_env,
             seed=seed,
             use_sde=use_sde,
             sde_sample_freq=sde_sample_freq,
             use_sde_at_warmup=use_sde_at_warmup,
-            optimize_memory_usage=optimize_memory_usage,
-            supported_action_spaces=(gym.spaces.Box),
+            supported_action_spaces=(spaces.Box,),
             support_multi_env=True,
         )
 
         self.target_entropy = target_entropy
-        self.log_ent_coef = None  # type: Optional[th.Tensor]
+        self.log_ent_coef = None  # type: th.Tensor | None
         # Entropy coefficient / Entropy temperature
         # Inverse of the reward scale
         self.ent_coef = ent_coef
         self.target_update_interval = target_update_interval
-        self.ent_coef_optimizer = None
+        self.ent_coef_optimizer: th.optim.Adam | None = None
 
         if _init_setup_model:
             self._setup_model()
 
     def _setup_model(self) -> None:
-        super(SAC, self)._setup_model()
+        super()._setup_model()
         self._create_aliases()
+        # Running mean and running var
+        self.batch_norm_stats = get_parameters_by_name(self.critic, ["running_"])
+        self.batch_norm_stats_target = get_parameters_by_name(self.critic_target, ["running_"])
         # Target entropy is used when learning the entropy coefficient
         if self.target_entropy == "auto":
             # automatically set target entropy if needed
-            self.target_entropy = -np.prod(self.env.action_space.shape).astype(np.float32)
+            self.target_entropy = float(-np.prod(self.env.action_space.shape).astype(np.float32))  # type: ignore
         else:
             # Force conversion
             # this will also throw an error for unexpected string
@@ -173,7 +192,7 @@ class SAC(OffPolicyAlgorithm):
             # Force conversion to float
             # this will throw an error if a malformed string (different from 'auto')
             # is passed
-            self.ent_coef_tensor = th.tensor(float(self.ent_coef)).to(self.device)
+            self.ent_coef_tensor = th.tensor(float(self.ent_coef), device=self.device)
 
     def _create_aliases(self) -> None:
         self.actor = self.policy.actor
@@ -196,7 +215,9 @@ class SAC(OffPolicyAlgorithm):
 
         for gradient_step in range(gradient_steps):
             # Sample replay buffer
-            replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)
+            replay_data = self.replay_buffer.sample(batch_size, env=self._vec_normalize_env)  # type: ignore[union-attr]
+            # For n-step replay, discount factor is gamma**n_steps (when no early termination)
+            discounts = replay_data.discounts if replay_data.discounts is not None else self.gamma
 
             # We need to sample because `log_std` may have changed between two gradient steps
             if self.use_sde:
@@ -207,11 +228,12 @@ class SAC(OffPolicyAlgorithm):
             log_prob = log_prob.reshape(-1, 1)
 
             ent_coef_loss = None
-            if self.ent_coef_optimizer is not None:
+            if self.ent_coef_optimizer is not None and self.log_ent_coef is not None:
                 # Important: detach the variable from the graph
                 # so we don't change it with other losses
                 # see https://github.com/rail-berkeley/softlearning/issues/60
                 ent_coef = th.exp(self.log_ent_coef.detach())
+                assert isinstance(self.target_entropy, float)
                 ent_coef_loss = -(self.log_ent_coef * (log_prob + self.target_entropy).detach()).mean()
                 ent_coef_losses.append(ent_coef_loss.item())
             else:
@@ -221,7 +243,7 @@ class SAC(OffPolicyAlgorithm):
 
             # Optimize entropy coefficient, also called
             # entropy temperature or alpha in the paper
-            if ent_coef_loss is not None:
+            if ent_coef_loss is not None and self.ent_coef_optimizer is not None:
                 self.ent_coef_optimizer.zero_grad()
                 ent_coef_loss.backward()
                 self.ent_coef_optimizer.step()
@@ -235,15 +257,16 @@ class SAC(OffPolicyAlgorithm):
                 # add entropy term
                 next_q_values = next_q_values - ent_coef * next_log_prob.reshape(-1, 1)
                 # td error + entropy term
-                target_q_values = replay_data.rewards + (1 - replay_data.dones) * self.gamma * next_q_values
+                target_q_values = replay_data.rewards + (1 - replay_data.dones) * discounts * next_q_values
 
             # Get current Q-values estimates for each critic network
             # using action from the replay buffer
             current_q_values = self.critic(replay_data.observations, replay_data.actions)
 
             # Compute critic loss
-            critic_loss = 0.5 * sum([F.mse_loss(current_q, target_q_values) for current_q in current_q_values])
-            critic_losses.append(critic_loss.item())
+            critic_loss = 0.5 * sum(F.mse_loss(current_q, target_q_values) for current_q in current_q_values)
+            assert isinstance(critic_loss, th.Tensor)  # for type checker
+            critic_losses.append(critic_loss.item())  # type: ignore[union-attr]
 
             # Optimize the critic
             self.critic.optimizer.zero_grad()
@@ -252,8 +275,8 @@ class SAC(OffPolicyAlgorithm):
 
             # Compute actor loss
             # Alternative: actor_loss = th.mean(log_prob - qf1_pi)
-            # Mean over all critic networks
-            q_values_pi = th.cat(self.critic.forward(replay_data.observations, actions_pi), dim=1)
+            # Min over all critic networks
+            q_values_pi = th.cat(self.critic(replay_data.observations, actions_pi), dim=1)
             min_qf_pi, _ = th.min(q_values_pi, dim=1, keepdim=True)
             actor_loss = (ent_coef * log_prob - min_qf_pi).mean()
             actor_losses.append(actor_loss.item())
@@ -266,6 +289,8 @@ class SAC(OffPolicyAlgorithm):
             # Update target networks
             if gradient_step % self.target_update_interval == 0:
                 polyak_update(self.critic.parameters(), self.critic_target.parameters(), self.tau)
+                # Copy running stats, see GH issue #996
+                polyak_update(self.batch_norm_stats, self.batch_norm_stats_target, 1.0)
 
         self._n_updates += gradient_steps
 
@@ -284,34 +309,27 @@ class SAC(OffPolicyAlgorithm):
 
 
     def learn(
-        self,
+        self: SelfSAC,
         total_timesteps: int,
         callback: MaybeCallback = None,
         log_interval: int = 4,
-        eval_env: Optional[GymEnv] = None,
-        eval_freq: int = -1,
-        n_eval_episodes: int = 5,
         tb_log_name: str = "SAC",
-        eval_log_path: Optional[str] = None,
         reset_num_timesteps: bool = True,
-    ) -> OffPolicyAlgorithm:
-
-        return super(SAC, self).learn(
+        progress_bar: bool = False,
+    ) -> SelfSAC:
+        return super().learn(
             total_timesteps=total_timesteps,
             callback=callback,
             log_interval=log_interval,
-            eval_env=eval_env,
-            eval_freq=eval_freq,
-            n_eval_episodes=n_eval_episodes,
             tb_log_name=tb_log_name,
-            eval_log_path=eval_log_path,
             reset_num_timesteps=reset_num_timesteps,
+            progress_bar=progress_bar,
         )
 
-    def _excluded_save_params(self) -> List[str]:
-        return super(SAC, self)._excluded_save_params() + ["actor", "critic", "critic_target"]
+    def _excluded_save_params(self) -> list[str]:
+        return super()._excluded_save_params() + ["actor", "critic", "critic_target"]  # noqa: RUF005
 
-    def _get_torch_save_params(self) -> Tuple[List[str], List[str]]:
+    def _get_torch_save_params(self) -> tuple[list[str], list[str]]:
         state_dicts = ["policy", "actor.optimizer", "critic.optimizer"]
         if self.ent_coef_optimizer is not None:
             saved_pytorch_variables = ["log_ent_coef"]

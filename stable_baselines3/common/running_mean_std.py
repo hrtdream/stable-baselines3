@@ -1,12 +1,10 @@
-from typing import Tuple, Union
-
 import numpy as np
 
 
-class RunningMeanStd(object):
-    def __init__(self, epsilon: float = 1e-4, shape: Tuple[int, ...] = ()):
+class RunningMeanStd:
+    def __init__(self, epsilon: float = 1e-4, shape: tuple[int, ...] = ()):
         """
-        Calulates the running mean and std of a data stream
+        Calculates the running mean and std of a data stream
         https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Parallel_algorithm
 
         :param epsilon: helps with arithmetic issues
@@ -40,7 +38,7 @@ class RunningMeanStd(object):
         batch_count = arr.shape[0]
         self.update_from_moments(batch_mean, batch_var, batch_count)
 
-    def update_from_moments(self, batch_mean: np.ndarray, batch_var: np.ndarray, batch_count: Union[int, float]) -> None:
+    def update_from_moments(self, batch_mean: np.ndarray, batch_var: np.ndarray, batch_count: float) -> None:
         delta = batch_mean - self.mean
         tot_count = self.count + batch_count
 
